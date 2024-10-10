@@ -23,8 +23,8 @@ pub trait ConfigLoader: Send + Sync {
     fn get_netns(&self) -> Option<String>;
     fn set_netns(&self, ns: Option<String>);
 
-    fn get_ipv4(&self) -> Option<std::net::Ipv4Addr>;
-    fn set_ipv4(&self, addr: Option<std::net::Ipv4Addr>);
+    fn get_ipv4(&self) -> Option<cidr::Ipv4Inet>;
+    fn set_ipv4(&self, addr: Option<cidr::Ipv4Inet>);
 
     fn get_dhcp(&self) -> bool;
     fn set_dhcp(&self, dhcp: bool);
@@ -72,7 +72,7 @@ pub trait ConfigLoader: Send + Sync {
 
 pub type NetworkSecretDigest = [u8; 32];
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, Eq, Hash)]
 pub struct NetworkIdentity {
     pub network_name: String,
     pub network_secret: Option<String>,
@@ -178,6 +178,10 @@ pub struct Flags {
     pub disable_p2p: bool,
     #[derivative(Default(value = "false"))]
     pub relay_all_peer_rpc: bool,
+    #[derivative(Default(value = "false"))]
+    pub disable_udp_hole_punching: bool,
+    #[derivative(Default(value = "\"udp://[::]:0\".to_string()"))]
+    pub ipv6_listener: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -206,7 +210,10 @@ struct Config {
 
     socks5_proxy: Option<url::Url>,
 
-    flags: Option<Flags>,
+    flags: Option<serde_json::Map<String, serde_json::Value>>,
+
+    #[serde(skip)]
+    flags_struct: Option<Flags>,
 }
 
 #[derive(Debug, Clone)]
@@ -222,12 +229,14 @@ impl Default for TomlConfigLoader {
 
 impl TomlConfigLoader {
     pub fn new_from_str(config_str: &str) -> Result<Self, anyhow::Error> {
-        let config = toml::de::from_str::<Config>(config_str).with_context(|| {
+        let mut config = toml::de::from_str::<Config>(config_str).with_context(|| {
             format!(
                 "failed to parse config file: {}\n{}",
                 config_str, config_str
             )
         })?;
+
+        config.flags_struct = Some(Self::gen_flags(config.flags.clone().unwrap_or_default()));
 
         Ok(TomlConfigLoader {
             config: Arc::new(Mutex::new(config)),
@@ -245,6 +254,24 @@ impl TomlConfigLoader {
         ));
 
         Ok(ret)
+    }
+
+    fn gen_flags(mut flags_hashmap: serde_json::Map<String, serde_json::Value>) -> Flags {
+        let default_flags_json = serde_json::to_string(&Flags::default()).unwrap();
+        let default_flags_hashmap =
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&default_flags_json)
+                .unwrap();
+
+        let mut merged_hashmap = serde_json::Map::new();
+        for (key, value) in default_flags_hashmap {
+            if let Some(v) = flags_hashmap.remove(&key) {
+                merged_hashmap.insert(key, v);
+            } else {
+                merged_hashmap.insert(key, value);
+            }
+        }
+
+        serde_json::from_value(serde_json::Value::Object(merged_hashmap)).unwrap()
     }
 }
 
@@ -297,16 +324,23 @@ impl ConfigLoader for TomlConfigLoader {
         self.config.lock().unwrap().netns = ns;
     }
 
-    fn get_ipv4(&self) -> Option<std::net::Ipv4Addr> {
+    fn get_ipv4(&self) -> Option<cidr::Ipv4Inet> {
         let locked_config = self.config.lock().unwrap();
         locked_config
             .ipv4
             .as_ref()
             .map(|s| s.parse().ok())
             .flatten()
+            .map(|c: cidr::Ipv4Inet| {
+                if c.network_length() == 32 {
+                    cidr::Ipv4Inet::new(c.address(), 24).unwrap()
+                } else {
+                    c
+                }
+            })
     }
 
-    fn set_ipv4(&self, addr: Option<std::net::Ipv4Addr>) {
+    fn set_ipv4(&self, addr: Option<cidr::Ipv4Inet>) {
         self.config.lock().unwrap().ipv4 = if let Some(addr) = addr {
             Some(addr.to_string())
         } else {
@@ -472,13 +506,13 @@ impl ConfigLoader for TomlConfigLoader {
         self.config
             .lock()
             .unwrap()
-            .flags
+            .flags_struct
             .clone()
             .unwrap_or_default()
     }
 
     fn set_flags(&self, flags: Flags) {
-        self.config.lock().unwrap().flags = Some(flags);
+        self.config.lock().unwrap().flags_struct = Some(flags);
     }
 
     fn get_exit_nodes(&self) -> Vec<Ipv4Addr> {
@@ -563,7 +597,7 @@ level = "warn"
         assert!(ret.is_ok());
 
         let ret = ret.unwrap();
-        assert_eq!("10.144.144.10", ret.get_ipv4().unwrap().to_string());
+        assert_eq!("10.144.144.10/24", ret.get_ipv4().unwrap().to_string());
 
         assert_eq!(
             vec!["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010"],

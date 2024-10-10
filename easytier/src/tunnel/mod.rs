@@ -8,7 +8,7 @@ use std::fmt::Debug;
 
 use tokio::time::error::Elapsed;
 
-use crate::rpc::TunnelInfo;
+use crate::proto::common::TunnelInfo;
 
 use self::packet_def::ZCPacket;
 
@@ -94,7 +94,7 @@ pub trait Tunnel: Send {
 
 #[auto_impl::auto_impl(Arc)]
 pub trait TunnelConnCounter: 'static + Send + Sync + Debug {
-    fn get(&self) -> u32;
+    fn get(&self) -> Option<u32>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -114,8 +114,8 @@ pub trait TunnelListener: Send {
         #[derive(Debug)]
         struct FakeTunnelConnCounter {}
         impl TunnelConnCounter for FakeTunnelConnCounter {
-            fn get(&self) -> u32 {
-                0
+            fn get(&self) -> Option<u32> {
+                None
             }
         }
         Arc::new(Box::new(FakeTunnelConnCounter {}))

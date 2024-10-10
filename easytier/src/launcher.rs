@@ -6,14 +6,16 @@ use std::{
 use crate::{
     common::{
         config::{ConfigLoader, TomlConfigLoader},
+        constants::EASYTIER_VERSION,
         global_ctx::GlobalCtxEvent,
         stun::StunInfoCollectorTrait,
     },
     instance::instance::Instance,
     peers::rpc_service::PeerManagerRpcService,
-    rpc::{
-        cli::{PeerInfo, Route, StunInfo},
-        peer::GetIpListResponse,
+    proto::{
+        cli::{PeerInfo, Route},
+        common::StunInfo,
+        peer_rpc::GetIpListResponse,
     },
     utils::{list_peer_route_pair, PeerRoutePair},
 };
@@ -24,6 +26,8 @@ use tokio::task::JoinSet;
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct MyNodeInfo {
     pub virtual_ipv4: String,
+    pub hostname: String,
+    pub version: String,
     pub ips: GetIpListResponse,
     pub stun_info: StunInfo,
     pub listeners: Vec<String>,
@@ -37,6 +41,7 @@ struct EasyTierData {
     routes: Arc<RwLock<Vec<Route>>>,
     peers: Arc<RwLock<Vec<PeerInfo>>>,
     tun_fd: Arc<RwLock<Option<i32>>>,
+    tun_dev_name: Arc<RwLock<String>>,
 }
 
 pub struct EasyTierLauncher {
@@ -132,11 +137,17 @@ impl EasyTierLauncher {
         let vpn_portal = instance.get_vpn_portal_inst();
         tasks.spawn(async move {
             loop {
+
+                // Update TUN Device Name
+                *data_c.tun_dev_name.write().unwrap() = global_ctx_c.get_flags().dev_name.clone();
+
                 let node_info = MyNodeInfo {
                     virtual_ipv4: global_ctx_c
                         .get_ipv4()
                         .map(|x| x.to_string())
                         .unwrap_or_default(),
+                    hostname: global_ctx_c.get_hostname(),
+                    version: EASYTIER_VERSION.to_string(),
                     ips: global_ctx_c.get_ip_collector().collect_ip_addrs().await,
                     stun_info: global_ctx_c.get_stun_info_collector().get_stun_info(),
                     listeners: global_ctx_c
@@ -229,6 +240,10 @@ impl EasyTierLauncher {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    pub fn get_dev_name(&self) -> String {
+        self.data.tun_dev_name.read().unwrap().clone()
+    }
+
     pub fn get_events(&self) -> Vec<(DateTime<Local>, GlobalCtxEvent)> {
         let events = self.data.events.read().unwrap();
         events.iter().cloned().collect()
@@ -261,6 +276,7 @@ impl Drop for EasyTierLauncher {
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct NetworkInstanceRunningInfo {
+    pub dev_name: String,
     pub my_node_info: MyNodeInfo,
     pub events: Vec<(DateTime<Local>, GlobalCtxEvent)>,
     pub node_info: MyNodeInfo,
@@ -300,6 +316,7 @@ impl NetworkInstance {
         let peer_route_pairs = list_peer_route_pair(peers.clone(), routes.clone());
 
         Some(NetworkInstanceRunningInfo {
+            dev_name: launcher.get_dev_name(),
             my_node_info: launcher.get_node_info(),
             events: launcher.get_events(),
             node_info: launcher.get_node_info(),

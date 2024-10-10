@@ -46,8 +46,8 @@ impl WindowsBuild {
 
     fn download_protoc() -> PathBuf {
         println!("cargo:info=use exist protoc: {:?}", "k");
-        let out_dir = Self::get_cargo_target_dir().unwrap();
-        let fname = out_dir.join("protoc");
+        let out_dir = Self::get_cargo_target_dir().unwrap().join("protobuf");
+        let fname = out_dir.join("bin/protoc.exe");
         if fname.exists() {
             println!("cargo:info=use exist protoc: {:?}", fname);
             return fname;
@@ -65,10 +65,7 @@ impl WindowsBuild {
             .map(zip::ZipArchive::new)
             .unwrap()
             .unwrap();
-        let protoc_zipped_file = content.by_name("bin/protoc.exe").unwrap();
-        let mut content = protoc_zipped_file;
-
-        copy(&mut content, &mut File::create(&fname).unwrap()).unwrap();
+        content.extract(out_dir).unwrap();
 
         fname
     }
@@ -129,14 +126,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     WindowsBuild::check_for_win();
 
-    tonic_build::configure()
-        .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
-        .type_attribute("cli.DirectConnectedPeerInfo", "#[derive(Hash)]")
-        .type_attribute("cli.PeerInfoForGlobalMap", "#[derive(Hash)]")
+    let proto_files = [
+        "src/proto/peer_rpc.proto",
+        "src/proto/common.proto",
+        "src/proto/error.proto",
+        "src/proto/tests.proto",
+        "src/proto/cli.proto",
+    ];
+
+    for proto_file in &proto_files {
+        println!("cargo:rerun-if-changed={}", proto_file);
+    }
+
+    prost_build::Config::new()
+        .type_attribute(".common", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".error", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".cli", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(
+            "peer_rpc.GetIpListResponse",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        )
+        .type_attribute("peer_rpc.DirectConnectedPeerInfo", "#[derive(Hash)]")
+        .type_attribute("peer_rpc.PeerInfoForGlobalMap", "#[derive(Hash)]")
+        .type_attribute("peer_rpc.ForeignNetworkRouteInfoKey", "#[derive(Hash, Eq)]")
+        .type_attribute("common.RpcDescriptor", "#[derive(Hash, Eq)]")
+        .service_generator(Box::new(rpc_build::ServiceGenerator::new()))
         .btree_map(&["."])
-        .compile(&["proto/cli.proto"], &["proto/"])
+        .compile_protos(&proto_files, &["src/proto/"])
         .unwrap();
-    // tonic_build::compile_protos("proto/cli.proto")?;
+
     check_locale();
     Ok(())
 }

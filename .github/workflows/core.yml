@@ -2,7 +2,7 @@ name: EasyTier Core
 
 on:
   push:
-    branches: ["develop", "main"]
+    branches: ["develop", "main", "releases/**"]
   pull_request:
     branches: ["develop", "main"]
 
@@ -20,14 +20,16 @@ jobs:
     runs-on: ubuntu-latest
     # Map a step output to a job output
     outputs:
-      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+      # do not skip push on branch starts with releases/
+      should_skip: ${{ steps.skip_check.outputs.should_skip == 'true' && !startsWith(github.ref_name, 'releases/') }}
     steps:
       - id: skip_check
         uses: fkirc/skip-duplicate-actions@v5
         with:
           # All of these options are optional, so you can remove them if you are happy with the defaults
-          concurrent_skipping: 'never'
+          concurrent_skipping: 'same_content_newer'
           skip_after_successful_duplicate: 'true'
+          cancel_others: 'true'
           paths: '["Cargo.toml", "Cargo.lock", "easytier/**", ".github/workflows/core.yml", ".github/workflows/install_rust.sh"]'
   build:
     strategy:
@@ -70,6 +72,11 @@ jobs:
             OS: windows-latest
             ARTIFACT_NAME: windows-x86_64
 
+          - TARGET: x86_64-unknown-freebsd
+            OS: ubuntu-latest
+            ARTIFACT_NAME: freebsd-13.2-x86_64
+            BSD_VERSION: 13.2
+
     runs-on: ${{ matrix.OS }}
     env:
       NAME: easytier
@@ -81,9 +88,9 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 21
+      - name: Set current ref as env variable
+        run: |
+          echo "GIT_DESC=$(git log -1 --format=%cd.%h --date=format:%Y-%m-%d_%H:%M:%S)" >> $GITHUB_ENV
 
       - name: Cargo cache
         uses: actions/cache@v4
@@ -93,9 +100,6 @@ jobs:
             ./target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install rust target
-        run: bash ./.github/workflows/install_rust.sh
-
       - name: Setup protoc
         uses: arduino/setup-protoc@v2
         with:
@@ -103,12 +107,51 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Core & Cli
+        if: ${{ ! endsWith(matrix.TARGET, 'freebsd') }}
         run: |
+          bash ./.github/workflows/install_rust.sh
           if [[ $OS =~ ^ubuntu.*$ && $TARGET =~ ^mips.*$ ]]; then
             cargo +nightly build -r --verbose --target $TARGET -Z build-std=std,panic_abort --no-default-features --features mips
           else
             cargo build --release --verbose --target $TARGET
           fi
+
+      # Copied and slightly modified from @lmq8267 (https://github.com/lmq8267)
+      - name: Build Core & Cli (X86_64 FreeBSD)
+        uses: cross-platform-actions/action@v0.23.0
+        if: ${{ endsWith(matrix.TARGET, 'freebsd') }}
+        env:
+          TARGET: ${{ matrix.TARGET }}
+        with:
+          operating_system: freebsd
+          environment_variables: TARGET
+          architecture: x86-64
+          version: ${{ matrix.BSD_VERSION }}
+          shell: bash
+          memory: 5G
+          cpu_count: 4
+          run: |
+            uname -a
+            echo $SHELL
+            pwd
+            ls -lah
+            whoami
+            env | sort
+
+            sudo pkg install -y git protobuf
+            curl --proto 'https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source $HOME/.cargo/env
+
+            rustup set auto-self-update disable
+
+            rustup install 1.77
+            rustup default 1.77
+
+            export CC=clang
+            export CXX=clang++
+            export CARGO_TERM_COLOR=always
+
+            cargo build --release --verbose --target $TARGET
 
       - name: Install UPX
         if: ${{ matrix.OS != 'macos-latest' }}
@@ -132,7 +175,7 @@ jobs:
             TAG=$GITHUB_SHA
           fi
 
-          if [[ $OS =~ ^ubuntu.*$ ]]; then
+          if [[ $OS =~ ^ubuntu.*$ && ! $TARGET =~ ^.*freebsd$ ]]; then
             upx --lzma --best ./target/$TARGET/release/easytier-core"$SUFFIX"
             upx --lzma --best ./target/$TARGET/release/easytier-cli"$SUFFIX"
           fi
@@ -159,7 +202,7 @@ jobs:
           endpoint: ${{ secrets.ALIYUN_OSS_ENDPOINT }}
           bucket: ${{ secrets.ALIYUN_OSS_BUCKET }}
           local-path: ./artifacts/
-          remote-path: /easytier-releases/${{ github.sha }}/
+          remote-path: /easytier-releases/${{env.GIT_DESC}}/easytier-${{ matrix.ARTIFACT_NAME }}
           no-delete-remote-files: true
           retry: 5
   core-result:

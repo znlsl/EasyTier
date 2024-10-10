@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use futures::{SinkExt, StreamExt, TryFutureExt};
+use futures::{StreamExt, TryFutureExt};
 
 use prost::Message;
 
@@ -18,23 +18,26 @@ use tokio::{
     time::{timeout, Duration},
 };
 
-use tokio_util::sync::PollSender;
 use tracing::Instrument;
 use zerocopy::AsBytes;
 
 use crate::{
     common::{
         config::{NetworkIdentity, NetworkSecretDigest},
+        defer,
         error::Error,
         global_ctx::ArcGlobalCtx,
         PeerId,
     },
-    rpc::{HandshakeRequest, PeerConnInfo, PeerConnStats, TunnelInfo},
-    tunnel::packet_def::PacketType,
+    proto::{
+        cli::{PeerConnInfo, PeerConnStats},
+        common::TunnelInfo,
+        peer_rpc::HandshakeRequest,
+    },
     tunnel::{
         filter::{StatsRecorderTunnelFilter, TunnelFilter, TunnelWithFilter},
         mpsc::{MpscTunnel, MpscTunnelSender},
-        packet_def::ZCPacket,
+        packet_def::{PacketType, ZCPacket},
         stats::{Throughput, WindowLatency},
         Tunnel, TunnelError, ZCPacketStream,
     },
@@ -61,6 +64,7 @@ pub struct PeerConn {
     tasks: JoinSet<Result<(), TunnelError>>,
 
     info: Option<HandshakeRequest>,
+    is_client: Option<bool>,
 
     close_event_sender: Option<mpsc::Sender<PeerConnId>>,
 
@@ -99,7 +103,9 @@ impl PeerConn {
             my_peer_id,
             global_ctx,
 
-            tunnel: Arc::new(Mutex::new(Box::new(mpsc_tunnel))),
+            tunnel: Arc::new(Mutex::new(Box::new(defer::Defer::new(move || {
+                mpsc_tunnel.close()
+            })))),
             sink,
             recv: Arc::new(Mutex::new(Some(recv))),
             tunnel_info,
@@ -107,6 +113,7 @@ impl PeerConn {
             tasks: JoinSet::new(),
 
             info: None,
+            is_client: None,
             close_event_sender: None,
 
             ctrl_resp_sender: ctrl_sender,
@@ -215,8 +222,14 @@ impl PeerConn {
         let rsp = self.wait_handshake_loop().await?;
         tracing::info!("handshake request: {:?}", rsp);
         self.info = Some(rsp);
+        self.is_client = Some(false);
         self.send_handshake().await?;
-        Ok(())
+
+        if self.get_peer_id() == self.my_peer_id {
+            Err(Error::WaitRespError("peer id conflict".to_owned()))
+        } else {
+            Ok(())
+        }
     }
 
     #[tracing::instrument]
@@ -226,7 +239,13 @@ impl PeerConn {
         let rsp = self.wait_handshake_loop().await?;
         tracing::info!("handshake response: {:?}", rsp);
         self.info = Some(rsp);
-        Ok(())
+        self.is_client = Some(true);
+
+        if self.get_peer_id() == self.my_peer_id {
+            Err(Error::WaitRespError("peer id conflict".to_owned()))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn handshake_done(&self) -> bool {
@@ -236,7 +255,7 @@ impl PeerConn {
     pub async fn start_recv_loop(&mut self, packet_recv_chan: PacketRecvChan) {
         let mut stream = self.recv.lock().await.take().unwrap();
         let sink = self.sink.clone();
-        let mut sender = PollSender::new(packet_recv_chan.clone());
+        let sender = packet_recv_chan.clone();
         let close_event_sender = self.close_event_sender.clone().unwrap();
         let conn_id = self.conn_id;
         let ctrl_sender = self.ctrl_resp_sender.clone();
@@ -302,6 +321,7 @@ impl PeerConn {
             self.ctrl_resp_sender.clone(),
             self.latency_stats.clone(),
             self.loss_rate_stats.clone(),
+            self.throughput.clone(),
         );
 
         let close_event_sender = self.close_event_sender.clone().unwrap();
@@ -359,14 +379,17 @@ impl PeerConn {
     }
 
     pub fn get_conn_info(&self) -> PeerConnInfo {
+        let info = self.info.as_ref().unwrap();
         PeerConnInfo {
             conn_id: self.conn_id.to_string(),
             my_peer_id: self.my_peer_id,
             peer_id: self.get_peer_id(),
-            features: self.info.as_ref().unwrap().features.clone(),
+            features: info.features.clone(),
             tunnel: self.tunnel_info.clone(),
             stats: Some(self.get_stats()),
             loss_rate: (f64::from(self.loss_rate_stats.load(Ordering::Relaxed)) / 100.0) as f32,
+            is_client: self.is_client.unwrap_or_default(),
+            network_name: info.network_name.clone(),
         }
     }
 }
@@ -378,9 +401,28 @@ mod tests {
     use super::*;
     use crate::common::global_ctx::tests::get_mock_global_ctx;
     use crate::common::new_peer_id;
+    use crate::common::scoped_task::ScopedTask;
     use crate::tunnel::filter::tests::DropSendTunnelFilter;
     use crate::tunnel::filter::PacketRecorderTunnelFilter;
     use crate::tunnel::ring::create_ring_tunnel_pair;
+
+    #[tokio::test]
+    async fn peer_conn_handshake_same_id() {
+        let (c, s) = create_ring_tunnel_pair();
+        let c_peer_id = new_peer_id();
+        let s_peer_id = c_peer_id;
+
+        let mut c_peer = PeerConn::new(c_peer_id, get_mock_global_ctx(), Box::new(c));
+        let mut s_peer = PeerConn::new(s_peer_id, get_mock_global_ctx(), Box::new(s));
+
+        let (c_ret, s_ret) = tokio::join!(
+            c_peer.do_handshake_as_client(),
+            s_peer.do_handshake_as_server()
+        );
+
+        assert!(c_ret.is_err());
+        assert!(s_ret.is_err());
+    }
 
     #[tokio::test]
     async fn peer_conn_handshake() {
@@ -419,12 +461,24 @@ mod tests {
         assert_eq!(c_peer.get_network_identity(), NetworkIdentity::default());
     }
 
-    async fn peer_conn_pingpong_test_common(drop_start: u32, drop_end: u32, conn_closed: bool) {
+    async fn peer_conn_pingpong_test_common(
+        drop_start: u32,
+        drop_end: u32,
+        conn_closed: bool,
+        drop_both: bool,
+    ) {
         let (c, s) = create_ring_tunnel_pair();
 
         // drop 1-3 packets should not affect pingpong
         let c_recorder = Arc::new(DropSendTunnelFilter::new(drop_start, drop_end));
         let c = TunnelWithFilter::new(c, c_recorder.clone());
+
+        let s = if drop_both {
+            let s_recorder = Arc::new(DropSendTunnelFilter::new(drop_start, drop_end));
+            Box::new(TunnelWithFilter::new(s, s_recorder.clone()))
+        } else {
+            s
+        };
 
         let c_peer_id = new_peer_id();
         let s_peer_id = new_peer_id();
@@ -452,7 +506,15 @@ mod tests {
             .start_recv_loop(tokio::sync::mpsc::channel(200).0)
             .await;
 
-        // wait 5s, conn should not be disconnected
+        let throughput = c_peer.throughput.clone();
+        let _t = ScopedTask::from(tokio::spawn(async move {
+            // if not drop both, we mock some rx traffic for client peer to test pinger
+            while !drop_both {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                throughput.record_rx_bytes(3);
+            }
+        }));
+
         tokio::time::sleep(Duration::from_secs(15)).await;
 
         if conn_closed {
@@ -463,9 +525,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_conn_pingpong_timeout() {
-        peer_conn_pingpong_test_common(3, 5, false).await;
-        peer_conn_pingpong_test_common(5, 12, true).await;
+    async fn peer_conn_pingpong_timeout_not_close() {
+        peer_conn_pingpong_test_common(3, 5, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn peer_conn_pingpong_oneside_timeout() {
+        peer_conn_pingpong_test_common(4, 12, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn peer_conn_pingpong_bothside_timeout() {
+        peer_conn_pingpong_test_common(4, 12, true, true).await;
     }
 
     #[tokio::test]

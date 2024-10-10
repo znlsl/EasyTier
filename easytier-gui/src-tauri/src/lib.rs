@@ -7,7 +7,7 @@ use anyhow::Context;
 use dashmap::DashMap;
 use easytier::{
     common::config::{
-        ConfigLoader, FileLoggerConfig, NetworkIdentity, PeerConfig, TomlConfigLoader,
+        ConfigLoader, FileLoggerConfig, Flags, NetworkIdentity, PeerConfig, TomlConfigLoader,
         VpnPortalConfig,
     },
     launcher::{NetworkInstance, NetworkInstanceRunningInfo},
@@ -60,6 +60,9 @@ struct NetworkConfig {
 
     listener_urls: Vec<String>,
     rpc_port: i32,
+    latency_first: bool,
+
+    dev_name: String,
 }
 
 impl NetworkConfig {
@@ -136,7 +139,7 @@ impl NetworkConfig {
         }
 
         cfg.set_rpc_portal(
-            format!("127.0.0.1:{}", self.rpc_port)
+            format!("0.0.0.0:{}", self.rpc_port)
                 .parse()
                 .with_context(|| format!("failed to parse rpc portal port: {}", self.rpc_port))?,
         );
@@ -160,7 +163,10 @@ impl NetworkConfig {
                     })?,
             });
         }
-
+        let mut flags = Flags::default();
+        flags.latency_first = self.latency_first;
+        flags.dev_name = self.dev_name.clone();
+        cfg.set_flags(flags);
         Ok(cfg)
     }
 }
@@ -170,6 +176,11 @@ static INSTANCE_MAP: once_cell::sync::Lazy<DashMap<String, NetworkInstance>> =
 
 static mut LOGGER_LEVEL_SENDER: once_cell::sync::Lazy<Option<NewFilterSender>> =
     once_cell::sync::Lazy::new(Default::default);
+
+#[tauri::command]
+fn easytier_version() -> Result<String, String> {
+    Ok(easytier::VERSION.to_string())
+}
 
 #[tauri::command]
 fn is_autostart() -> Result<bool, String> {
@@ -300,23 +311,24 @@ pub fn run() {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        builder = builder
-            .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
-                app.webview_windows()
-                    .values()
-                    .next()
-                    .expect("Sorry, no window found")
-                    .set_focus()
-                    .expect("Can't Bring Window to Focus");
-            }));
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            app.webview_windows()
+                .values()
+                .next()
+                .expect("Sorry, no window found")
+                .set_focus()
+                .expect("Can't Bring Window to Focus");
+        }));
     }
 
-    builder
+    builder = builder
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_vpnservice::init())
+        .plugin(tauri_plugin_vpnservice::init());
+
+    builder
         .setup(|app| {
             // for logging config
             let Ok(log_dir) = app.path().app_log_dir() else {
@@ -364,7 +376,8 @@ pub fn run() {
             get_os_hostname,
             set_logging_level,
             set_tun_fd,
-            is_autostart
+            is_autostart,
+            easytier_version
         ])
         .on_window_event(|_win, event| match event {
             #[cfg(not(target_os = "android"))]

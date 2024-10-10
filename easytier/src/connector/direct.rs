@@ -1,13 +1,25 @@
 // try connect peers directly, with either its public ip or lan ip
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use crate::{
     common::{error::Error, global_ctx::ArcGlobalCtx, PeerId},
-    peers::{peer_manager::PeerManager, peer_rpc::PeerRpcManager},
+    peers::{
+        peer_manager::PeerManager, peer_rpc::PeerRpcManager,
+        peer_rpc_service::DirectConnectorManagerRpcServer,
+    },
+    proto::{
+        peer_rpc::{
+            DirectConnectorRpc, DirectConnectorRpcClientFactory, DirectConnectorRpcServer,
+            GetIpListRequest, GetIpListResponse,
+        },
+        rpc_types::controller::BaseController,
+    },
 };
 
-use crate::rpc::{peer::GetIpListResponse, PeerConnInfo};
+use crate::proto::cli::PeerConnInfo;
+use anyhow::Context;
+use rand::Rng;
 use tokio::{task::JoinSet, time::timeout};
 use tracing::Instrument;
 use url::Host;
@@ -16,11 +28,6 @@ use super::create_connector_by_url;
 
 pub const DIRECT_CONNECTOR_SERVICE_ID: u32 = 1;
 pub const DIRECT_CONNECTOR_BLACKLIST_TIMEOUT_SEC: u64 = 300;
-
-#[tarpc::service]
-pub trait DirectConnectorRpc {
-    async fn get_ip_list() -> GetIpListResponse;
-}
 
 #[async_trait::async_trait]
 pub trait PeerManagerForDirectConnector {
@@ -35,7 +42,10 @@ impl PeerManagerForDirectConnector for PeerManager {
         let mut ret = vec![];
 
         let routes = self.list_routes().await;
-        for r in routes.iter() {
+        for r in routes
+            .iter()
+            .filter(|r| r.feature_flag.map(|r| !r.is_public_server).unwrap_or(true))
+        {
             ret.push(r.peer_id);
         }
 
@@ -51,38 +61,17 @@ impl PeerManagerForDirectConnector for PeerManager {
     }
 }
 
-#[derive(Clone)]
-struct DirectConnectorManagerRpcServer {
-    // TODO: this only cache for one src peer, should make it global
-    global_ctx: ArcGlobalCtx,
-}
-
-#[tarpc::server]
-impl DirectConnectorRpc for DirectConnectorManagerRpcServer {
-    async fn get_ip_list(self, _: tarpc::context::Context) -> GetIpListResponse {
-        let mut ret = self.global_ctx.get_ip_collector().collect_ip_addrs().await;
-        ret.listeners = self.global_ctx.get_running_listeners();
-        ret
-    }
-}
-
-impl DirectConnectorManagerRpcServer {
-    pub fn new(global_ctx: ArcGlobalCtx) -> Self {
-        Self { global_ctx }
-    }
-}
-
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct DstBlackListItem(PeerId, String);
 
 #[derive(Hash, Eq, PartialEq, Clone)]
-struct DstSchemeBlackListItem(PeerId, String);
+struct DstListenerUrlBlackListItem(PeerId, url::Url);
 
 struct DirectConnectorManagerData {
     global_ctx: ArcGlobalCtx,
     peer_manager: Arc<PeerManager>,
     dst_blacklist: timedmap::TimedMap<DstBlackListItem, ()>,
-    dst_sceme_blacklist: timedmap::TimedMap<DstSchemeBlackListItem, ()>,
+    dst_listener_blacklist: timedmap::TimedMap<DstListenerUrlBlackListItem, ()>,
 }
 
 impl DirectConnectorManagerData {
@@ -91,7 +80,7 @@ impl DirectConnectorManagerData {
             global_ctx,
             peer_manager,
             dst_blacklist: timedmap::TimedMap::new(),
-            dst_sceme_blacklist: timedmap::TimedMap::new(),
+            dst_listener_blacklist: timedmap::TimedMap::new(),
         }
     }
 }
@@ -130,10 +119,17 @@ impl DirectConnectorManager {
     }
 
     pub fn run_as_server(&mut self) {
-        self.data.peer_manager.get_peer_rpc_mgr().run_service(
-            DIRECT_CONNECTOR_SERVICE_ID,
-            DirectConnectorManagerRpcServer::new(self.global_ctx.clone()).serve(),
-        );
+        self.data
+            .peer_manager
+            .get_peer_rpc_mgr()
+            .rpc_server()
+            .registry()
+            .register(
+                DirectConnectorRpcServer::new(DirectConnectorManagerRpcServer::new(
+                    self.global_ctx.clone(),
+                )),
+                &self.data.global_ctx.get_network_name(),
+            );
     }
 
     pub fn run_as_client(&mut self) {
@@ -152,7 +148,7 @@ impl DirectConnectorManager {
                     }
 
                     while let Some(task_ret) = tasks.join_next().await {
-                        tracing::trace!(?task_ret, "direct connect task ret");
+                        tracing::debug!(?task_ret, ?my_peer_id, "direct connect task ret");
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
@@ -173,7 +169,7 @@ impl DirectConnectorManager {
             .dst_blacklist
             .contains(&DstBlackListItem(dst_peer_id.clone(), addr.clone()))
         {
-            tracing::trace!("try_connect_to_ip failed, addr in blacklist: {}", addr);
+            tracing::debug!("try_connect_to_ip failed, addr in blacklist: {}", addr);
             return Err(Error::UrlInBlacklist);
         }
 
@@ -208,24 +204,38 @@ impl DirectConnectorManager {
         dst_peer_id: PeerId,
         addr: String,
     ) -> Result<(), Error> {
-        let ret = Self::do_try_connect_to_ip(data.clone(), dst_peer_id, addr.clone()).await;
-        if let Err(e) = ret {
-            if !matches!(e, Error::UrlInBlacklist) {
-                tracing::info!(
-                    "try_connect_to_ip failed: {:?}, peer_id: {}",
-                    e,
-                    dst_peer_id
-                );
+        let mut rand_gen = rand::rngs::OsRng::default();
+        let backoff_ms = vec![1000, 2000, 4000];
+        let mut backoff_idx = 0;
+
+        loop {
+            let ret = Self::do_try_connect_to_ip(data.clone(), dst_peer_id, addr.clone()).await;
+            tracing::debug!(?ret, ?dst_peer_id, ?addr, "try_connect_to_ip return");
+            if matches!(ret, Err(Error::UrlInBlacklist) | Ok(_)) {
+                return ret;
+            }
+
+            if backoff_idx < backoff_ms.len() {
+                let delta = backoff_ms[backoff_idx] >> 1;
+                assert!(delta > 0);
+                assert!(delta < backoff_ms[backoff_idx]);
+
+                tokio::time::sleep(Duration::from_millis(
+                    (backoff_ms[backoff_idx] + rand_gen.gen_range(-delta..delta)) as u64,
+                ))
+                .await;
+
+                backoff_idx += 1;
+                continue;
+            } else {
                 data.dst_blacklist.insert(
                     DstBlackListItem(dst_peer_id.clone(), addr.clone()),
                     (),
                     std::time::Duration::from_secs(DIRECT_CONNECTOR_BLACKLIST_TIMEOUT_SEC),
                 );
+
+                return ret;
             }
-            return Err(e);
-        } else {
-            tracing::info!("try_connect_to_ip success, peer_id: {}", dst_peer_id);
-            return Ok(());
         }
     }
 
@@ -235,20 +245,24 @@ impl DirectConnectorManager {
         dst_peer_id: PeerId,
         ip_list: GetIpListResponse,
     ) -> Result<(), Error> {
+        data.dst_listener_blacklist.cleanup();
+
         let enable_ipv6 = data.global_ctx.get_flags().enable_ipv6;
         let available_listeners = ip_list
             .listeners
-            .iter()
+            .into_iter()
+            .map(Into::<url::Url>::into)
             .filter_map(|l| if l.scheme() != "ring" { Some(l) } else { None })
             .filter(|l| l.port().is_some() && l.host().is_some())
             .filter(|l| {
-                !data.dst_sceme_blacklist.contains(&DstSchemeBlackListItem(
-                    dst_peer_id.clone(),
-                    l.scheme().to_string(),
-                ))
+                !data
+                    .dst_listener_blacklist
+                    .contains(&DstListenerUrlBlackListItem(dst_peer_id.clone(), l.clone()))
             })
             .filter(|l| enable_ipv6 || !matches!(l.host().unwrap().to_owned(), Host::Ipv6(_)))
             .collect::<Vec<_>>();
+
+        tracing::debug!(?available_listeners, "got available listeners");
 
         let mut listener = available_listeners.get(0).ok_or(anyhow::anyhow!(
             "peer {} have no valid listener",
@@ -268,46 +282,84 @@ impl DirectConnectorManager {
             Some(SocketAddr::V4(_)) => {
                 ip_list.interface_ipv4s.iter().for_each(|ip| {
                     let mut addr = (*listener).clone();
-                    if addr.set_host(Some(ip.as_str())).is_ok() {
+                    if addr.set_host(Some(ip.to_string().as_str())).is_ok() {
                         tasks.spawn(Self::try_connect_to_ip(
                             data.clone(),
                             dst_peer_id.clone(),
                             addr.to_string(),
                         ));
+                    } else {
+                        tracing::error!(
+                            ?ip,
+                            ?listener,
+                            ?dst_peer_id,
+                            "failed to set host for interface ipv4"
+                        );
                     }
                 });
 
-                let mut addr = (*listener).clone();
-                if addr.set_host(Some(ip_list.public_ipv4.as_str())).is_ok() {
-                    tasks.spawn(Self::try_connect_to_ip(
-                        data.clone(),
-                        dst_peer_id.clone(),
-                        addr.to_string(),
-                    ));
+                if let Some(public_ipv4) = ip_list.public_ipv4 {
+                    let mut addr = (*listener).clone();
+                    if addr
+                        .set_host(Some(public_ipv4.to_string().as_str()))
+                        .is_ok()
+                    {
+                        tasks.spawn(Self::try_connect_to_ip(
+                            data.clone(),
+                            dst_peer_id.clone(),
+                            addr.to_string(),
+                        ));
+                    } else {
+                        tracing::error!(
+                            ?public_ipv4,
+                            ?listener,
+                            ?dst_peer_id,
+                            "failed to set host for public ipv4"
+                        );
+                    }
                 }
             }
             Some(SocketAddr::V6(_)) => {
                 ip_list.interface_ipv6s.iter().for_each(|ip| {
                     let mut addr = (*listener).clone();
-                    if addr.set_host(Some(format!("[{}]", ip).as_str())).is_ok() {
+                    if addr
+                        .set_host(Some(format!("[{}]", ip.to_string()).as_str()))
+                        .is_ok()
+                    {
                         tasks.spawn(Self::try_connect_to_ip(
                             data.clone(),
                             dst_peer_id.clone(),
                             addr.to_string(),
                         ));
+                    } else {
+                        tracing::error!(
+                            ?ip,
+                            ?listener,
+                            ?dst_peer_id,
+                            "failed to set host for interface ipv6"
+                        );
                     }
                 });
 
-                let mut addr = (*listener).clone();
-                if addr
-                    .set_host(Some(format!("[{}]", ip_list.public_ipv6).as_str()))
-                    .is_ok()
-                {
-                    tasks.spawn(Self::try_connect_to_ip(
-                        data.clone(),
-                        dst_peer_id.clone(),
-                        addr.to_string(),
-                    ));
+                if let Some(public_ipv6) = ip_list.public_ipv6 {
+                    let mut addr = (*listener).clone();
+                    if addr
+                        .set_host(Some(format!("[{}]", public_ipv6.to_string()).as_str()))
+                        .is_ok()
+                    {
+                        tasks.spawn(Self::try_connect_to_ip(
+                            data.clone(),
+                            dst_peer_id.clone(),
+                            addr.to_string(),
+                        ));
+                    } else {
+                        tracing::error!(
+                            ?public_ipv6,
+                            ?listener,
+                            ?dst_peer_id,
+                            "failed to set host for public ipv6"
+                        );
+                    }
                 }
             }
             p => {
@@ -317,16 +369,28 @@ impl DirectConnectorManager {
 
         let mut has_succ = false;
         while let Some(ret) = tasks.join_next().await {
-            if let Err(e) = ret {
-                tracing::error!("join direct connect task failed: {:?}", e);
-            } else if let Ok(Ok(_)) = ret {
-                has_succ = true;
+            match ret {
+                Ok(Ok(_)) => {
+                    has_succ = true;
+                    tracing::info!(
+                        ?dst_peer_id,
+                        ?listener,
+                        "try direct connect to peer success"
+                    );
+                    break;
+                }
+                Ok(Err(e)) => {
+                    tracing::info!(?e, "try direct connect to peer failed");
+                }
+                Err(e) => {
+                    tracing::error!(?e, "try direct connect to peer task join failed");
+                }
             }
         }
 
         if !has_succ {
-            data.dst_sceme_blacklist.insert(
-                DstSchemeBlackListItem(dst_peer_id.clone(), listener.scheme().to_string()),
+            data.dst_listener_blacklist.insert(
+                DstListenerUrlBlackListItem(dst_peer_id.clone(), listener.clone()),
                 (),
                 std::time::Duration::from_secs(DIRECT_CONNECTOR_BLACKLIST_TIMEOUT_SEC),
             );
@@ -349,18 +413,23 @@ impl DirectConnectorManager {
             }
         }
 
-        tracing::trace!("try direct connect to peer: {}", dst_peer_id);
+        tracing::debug!("try direct connect to peer: {}", dst_peer_id);
 
-        let ip_list = peer_manager
+        let rpc_stub = peer_manager
             .get_peer_rpc_mgr()
-            .do_client_rpc_scoped(1, dst_peer_id, |c| async {
-                let client =
-                    DirectConnectorRpcClient::new(tarpc::client::Config::default(), c).spawn();
-                let ip_list = client.get_ip_list(tarpc::context::current()).await;
-                tracing::info!(ip_list = ?ip_list, dst_peer_id = ?dst_peer_id, "got ip list");
-                ip_list
-            })
-            .await?;
+            .rpc_client()
+            .scoped_client::<DirectConnectorRpcClientFactory<BaseController>>(
+                peer_manager.my_peer_id(),
+                dst_peer_id,
+                data.global_ctx.get_network_name(),
+            );
+
+        let ip_list = rpc_stub
+            .get_ip_list(BaseController::default(), GetIpListRequest {})
+            .await
+            .with_context(|| format!("get ip list from peer {}", dst_peer_id))?;
+
+        tracing::info!(ip_list = ?ip_list, dst_peer_id = ?dst_peer_id, "got ip list");
 
         Self::do_try_direct_connect_internal(data, dst_peer_id, ip_list).await
     }
@@ -373,14 +442,14 @@ mod tests {
     use crate::{
         connector::direct::{
             DirectConnectorManager, DirectConnectorManagerData, DstBlackListItem,
-            DstSchemeBlackListItem,
+            DstListenerUrlBlackListItem,
         },
         instance::listeners::ListenerManager,
         peers::tests::{
             connect_peer_manager, create_mock_peer_manager, wait_route_appear,
             wait_route_appear_with_cost,
         },
-        rpc::peer::GetIpListResponse,
+        proto::peer_rpc::GetIpListResponse,
     };
 
     #[rstest::rstest]
@@ -436,20 +505,25 @@ mod tests {
             p_a.get_global_ctx(),
             p_a.clone(),
         ));
-        let mut ip_list = GetIpListResponse::new();
+        let mut ip_list = GetIpListResponse::default();
         ip_list
             .listeners
             .push("tcp://127.0.0.1:10222".parse().unwrap());
 
-        ip_list.interface_ipv4s.push("127.0.0.1".to_string());
+        ip_list
+            .interface_ipv4s
+            .push("127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().into());
 
         DirectConnectorManager::do_try_direct_connect_internal(data.clone(), 1, ip_list.clone())
             .await
             .unwrap();
 
         assert!(data
-            .dst_sceme_blacklist
-            .contains(&DstSchemeBlackListItem(1, "tcp".into())));
+            .dst_listener_blacklist
+            .contains(&DstListenerUrlBlackListItem(
+                1,
+                "tcp://127.0.0.1:10222".parse().unwrap()
+            )));
 
         assert!(data
             .dst_blacklist

@@ -111,9 +111,10 @@ impl<H: TunnelHandlerForListener + Send + Sync + 'static + Debug> ListenerManage
         }
 
         if self.global_ctx.config.get_flags().enable_ipv6 {
+            let ipv6_listener = self.global_ctx.config.get_flags().ipv6_listener.clone();
             let _ = self
                 .add_listener(
-                    UdpTunnelListener::new("udp://[::]:0".parse().unwrap()),
+                    UdpTunnelListener::new(ipv6_listener.parse().unwrap()),
                     false,
                 )
                 .await?;
@@ -159,8 +160,16 @@ impl<H: TunnelHandlerForListener + Send + Sync + 'static + Debug> ListenerManage
 
             let tunnel_info = ret.info().unwrap();
             global_ctx.issue_event(GlobalCtxEvent::ConnectionAccepted(
-                tunnel_info.local_addr.clone(),
-                tunnel_info.remote_addr.clone(),
+                tunnel_info
+                    .local_addr
+                    .clone()
+                    .unwrap_or_default()
+                    .to_string(),
+                tunnel_info
+                    .remote_addr
+                    .clone()
+                    .unwrap_or_default()
+                    .to_string(),
             ));
             tracing::info!(ret = ?ret, "conn accepted");
             let peer_manager = peer_manager.clone();
@@ -169,8 +178,8 @@ impl<H: TunnelHandlerForListener + Send + Sync + 'static + Debug> ListenerManage
                 let server_ret = peer_manager.handle_tunnel(ret).await;
                 if let Err(e) = &server_ret {
                     global_ctx.issue_event(GlobalCtxEvent::ConnectionError(
-                        tunnel_info.local_addr,
-                        tunnel_info.remote_addr,
+                        tunnel_info.local_addr.unwrap_or_default().to_string(),
+                        tunnel_info.remote_addr.unwrap_or_default().to_string(),
                         e.to_string(),
                     ));
                     tracing::error!(error = ?e, "handle conn error");

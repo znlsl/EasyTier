@@ -1,26 +1,29 @@
 #![allow(dead_code)]
 
-use std::{net::SocketAddr, time::Duration, vec};
+use std::{net::SocketAddr, sync::Mutex, time::Duration, vec};
 
+use anyhow::{Context, Ok};
 use clap::{command, Args, Parser, Subcommand};
 use common::stun::StunInfoCollectorTrait;
-use rpc::vpn_portal_rpc_client::VpnPortalRpcClient;
+use proto::{
+    common::NatType,
+    peer_rpc::{GetGlobalPeerMapRequest, PeerCenterRpc, PeerCenterRpcClientFactory},
+    rpc_impl::standalone::StandAloneClient,
+    rpc_types::controller::BaseController,
+};
 use tokio::time::timeout;
+use tunnel::tcp::TcpTunnelConnector;
 use utils::{list_peer_route_pair, PeerRoutePair};
 
 mod arch;
 mod common;
-mod rpc;
+mod proto;
 mod tunnel;
 mod utils;
 
 use crate::{
     common::stun::StunInfoCollector,
-    rpc::{
-        connector_manage_rpc_client::ConnectorManageRpcClient,
-        peer_center_rpc_client::PeerCenterRpcClient, peer_manage_rpc_client::PeerManageRpcClient,
-        *,
-    },
+    proto::cli::*,
     utils::{cost_to_str, float_to_str},
 };
 use humansize::format_size;
@@ -48,6 +51,7 @@ enum SubCommand {
     Route(RouteArgs),
     PeerCenter,
     VpnPortal,
+    Node(NodeArgs),
 }
 
 #[derive(Args, Debug)]
@@ -68,6 +72,7 @@ enum PeerSubCommand {
     Remove,
     List(PeerListArgs),
     ListForeign,
+    ListGlobalForeign,
 }
 
 #[derive(Args, Debug)]
@@ -101,56 +106,90 @@ enum ConnectorSubCommand {
     List,
 }
 
-#[derive(thiserror::Error, Debug)]
-enum Error {
-    #[error("tonic transport error")]
-    TonicTransportError(#[from] tonic::transport::Error),
-    #[error("tonic rpc error")]
-    TonicRpcError(#[from] tonic::Status),
+#[derive(Subcommand, Debug)]
+enum NodeSubCommand {
+    Info,
+    Config,
 }
 
+#[derive(Args, Debug)]
+struct NodeArgs {
+    #[command(subcommand)]
+    sub_command: Option<NodeSubCommand>,
+}
+
+type Error = anyhow::Error;
+
 struct CommandHandler {
-    addr: String,
+    client: Mutex<RpcClient>,
     verbose: bool,
 }
+
+type RpcClient = StandAloneClient<TcpTunnelConnector>;
 
 impl CommandHandler {
     async fn get_peer_manager_client(
         &self,
-    ) -> Result<PeerManageRpcClient<tonic::transport::Channel>, Error> {
-        Ok(PeerManageRpcClient::connect(self.addr.clone()).await?)
+    ) -> Result<Box<dyn PeerManageRpc<Controller = BaseController>>, Error> {
+        Ok(self
+            .client
+            .lock()
+            .unwrap()
+            .scoped_client::<PeerManageRpcClientFactory<BaseController>>("".to_string())
+            .await
+            .with_context(|| "failed to get peer manager client")?)
     }
 
     async fn get_connector_manager_client(
         &self,
-    ) -> Result<ConnectorManageRpcClient<tonic::transport::Channel>, Error> {
-        Ok(ConnectorManageRpcClient::connect(self.addr.clone()).await?)
+    ) -> Result<Box<dyn ConnectorManageRpc<Controller = BaseController>>, Error> {
+        Ok(self
+            .client
+            .lock()
+            .unwrap()
+            .scoped_client::<ConnectorManageRpcClientFactory<BaseController>>("".to_string())
+            .await
+            .with_context(|| "failed to get connector manager client")?)
     }
 
     async fn get_peer_center_client(
         &self,
-    ) -> Result<PeerCenterRpcClient<tonic::transport::Channel>, Error> {
-        Ok(PeerCenterRpcClient::connect(self.addr.clone()).await?)
+    ) -> Result<Box<dyn PeerCenterRpc<Controller = BaseController>>, Error> {
+        Ok(self
+            .client
+            .lock()
+            .unwrap()
+            .scoped_client::<PeerCenterRpcClientFactory<BaseController>>("".to_string())
+            .await
+            .with_context(|| "failed to get peer center client")?)
     }
 
     async fn get_vpn_portal_client(
         &self,
-    ) -> Result<VpnPortalRpcClient<tonic::transport::Channel>, Error> {
-        Ok(VpnPortalRpcClient::connect(self.addr.clone()).await?)
+    ) -> Result<Box<dyn VpnPortalRpc<Controller = BaseController>>, Error> {
+        Ok(self
+            .client
+            .lock()
+            .unwrap()
+            .scoped_client::<VpnPortalRpcClientFactory<BaseController>>("".to_string())
+            .await
+            .with_context(|| "failed to get vpn portal client")?)
     }
 
     async fn list_peers(&self) -> Result<ListPeerResponse, Error> {
-        let mut client = self.get_peer_manager_client().await?;
-        let request = tonic::Request::new(ListPeerRequest::default());
-        let response = client.list_peer(request).await?;
-        Ok(response.into_inner())
+        let client = self.get_peer_manager_client().await?;
+        let request = ListPeerRequest::default();
+        let response = client.list_peer(BaseController::default(), request).await?;
+        Ok(response)
     }
 
     async fn list_routes(&self) -> Result<ListRouteResponse, Error> {
-        let mut client = self.get_peer_manager_client().await?;
-        let request = tonic::Request::new(ListRouteRequest::default());
-        let response = client.list_route(request).await?;
-        Ok(response.into_inner())
+        let client = self.get_peer_manager_client().await?;
+        let request = ListRouteRequest::default();
+        let response = client
+            .list_route(BaseController::default(), request)
+            .await?;
+        Ok(response)
     }
 
     async fn list_peer_route_pair(&self) -> Result<Vec<PeerRoutePair>, Error> {
@@ -182,12 +221,18 @@ impl CommandHandler {
             tunnel_proto: String,
             nat_type: String,
             id: String,
+            version: String,
         }
 
         impl From<PeerRoutePair> for PeerTableItem {
             fn from(p: PeerRoutePair) -> Self {
                 PeerTableItem {
-                    ipv4: p.route.ipv4_addr.clone(),
+                    ipv4: p
+                        .route
+                        .ipv4_addr
+                        .clone()
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_default(),
                     hostname: p.route.hostname.clone(),
                     cost: cost_to_str(p.route.cost),
                     lat_ms: float_to_str(p.get_latency_ms().unwrap_or(0.0), 3),
@@ -197,6 +242,33 @@ impl CommandHandler {
                     tunnel_proto: p.get_conn_protos().unwrap_or(vec![]).join(",").to_string(),
                     nat_type: p.get_udp_nat_type(),
                     id: p.route.peer_id.to_string(),
+                    version: if p.route.version.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        p.route.version.to_string()
+                    },
+                }
+            }
+        }
+
+        impl From<NodeInfo> for PeerTableItem {
+            fn from(p: NodeInfo) -> Self {
+                PeerTableItem {
+                    ipv4: p.ipv4_addr.clone(),
+                    hostname: p.hostname.clone(),
+                    cost: "Local".to_string(),
+                    lat_ms: "-".to_string(),
+                    loss_rate: "-".to_string(),
+                    rx_bytes: "-".to_string(),
+                    tx_bytes: "-".to_string(),
+                    tunnel_proto: "-".to_string(),
+                    nat_type: if let Some(info) = p.stun_info {
+                        info.udp_nat_type().as_str_name().to_string()
+                    } else {
+                        "Unknown".to_string()
+                    },
+                    id: p.peer_id.to_string(),
+                    version: p.version,
                 }
             }
         }
@@ -207,6 +279,14 @@ impl CommandHandler {
             println!("{:#?}", peer_routes);
             return Ok(());
         }
+
+        let client = self.get_peer_manager_client().await?;
+        let node_info = client
+            .show_node_info(BaseController::default(), ShowNodeInfoRequest::default())
+            .await?
+            .node_info
+            .ok_or(anyhow::anyhow!("node info not found"))?;
+        items.push(node_info.into());
 
         for p in peer_routes {
             items.push(p.into());
@@ -221,18 +301,22 @@ impl CommandHandler {
     }
 
     async fn handle_route_dump(&self) -> Result<(), Error> {
-        let mut client = self.get_peer_manager_client().await?;
-        let request = tonic::Request::new(DumpRouteRequest::default());
-        let response = client.dump_route(request).await?;
-        println!("response: {}", response.into_inner().result);
+        let client = self.get_peer_manager_client().await?;
+        let request = DumpRouteRequest::default();
+        let response = client
+            .dump_route(BaseController::default(), request)
+            .await?;
+        println!("response: {}", response.result);
         Ok(())
     }
 
     async fn handle_foreign_network_list(&self) -> Result<(), Error> {
-        let mut client = self.get_peer_manager_client().await?;
-        let request = tonic::Request::new(ListForeignNetworkRequest::default());
-        let response = client.list_foreign_network(request).await?;
-        let network_map = response.into_inner();
+        let client = self.get_peer_manager_client().await?;
+        let request = ListForeignNetworkRequest::default();
+        let response = client
+            .list_foreign_network(BaseController::default(), request)
+            .await?;
+        let network_map = response;
         if self.verbose {
             println!("{:#?}", network_map);
             return Ok(());
@@ -251,7 +335,7 @@ impl CommandHandler {
                             "remote_addr: {}, rx_bytes: {}, tx_bytes: {}, latency_us: {}",
                             conn.tunnel
                                 .as_ref()
-                                .map(|t| t.remote_addr.clone())
+                                .map(|t| t.remote_addr.clone().unwrap_or_default())
                                 .unwrap_or_default(),
                             conn.stats.as_ref().map(|s| s.rx_bytes).unwrap_or_default(),
                             conn.stats.as_ref().map(|s| s.tx_bytes).unwrap_or_default(),
@@ -268,6 +352,30 @@ impl CommandHandler {
         Ok(())
     }
 
+    async fn handle_global_foreign_network_list(&self) -> Result<(), Error> {
+        let client = self.get_peer_manager_client().await?;
+        let request = ListGlobalForeignNetworkRequest::default();
+        let response = client
+            .list_global_foreign_network(BaseController::default(), request)
+            .await?;
+        if self.verbose {
+            println!("{:#?}", response);
+            return Ok(());
+        }
+
+        for (k, v) in response.foreign_networks.iter() {
+            println!("Peer ID: {}", k);
+            for n in v.foreign_networks.iter() {
+                println!(
+                    "  Network Name: {}, Last Updated: {}, Version: {}, PeerIds: {:?}",
+                    n.network_name, n.last_updated, n.version, n.peer_ids
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     async fn handle_route_list(&self) -> Result<(), Error> {
         #[derive(tabled::Tabled)]
         struct RouteTableItem {
@@ -278,9 +386,27 @@ impl CommandHandler {
             next_hop_hostname: String,
             next_hop_lat: f64,
             cost: i32,
+            version: String,
         }
 
         let mut items: Vec<RouteTableItem> = vec![];
+        let client = self.get_peer_manager_client().await?;
+        let node_info = client
+            .show_node_info(BaseController::default(), ShowNodeInfoRequest::default())
+            .await?
+            .node_info
+            .ok_or(anyhow::anyhow!("node info not found"))?;
+
+        items.push(RouteTableItem {
+            ipv4: node_info.ipv4_addr.clone(),
+            hostname: node_info.hostname.clone(),
+            proxy_cidrs: node_info.proxy_cidrs.join(", "),
+            next_hop_ipv4: "-".to_string(),
+            next_hop_hostname: "Local".to_string(),
+            next_hop_lat: 0.0,
+            cost: 0,
+            version: node_info.version.clone(),
+        });
         let peer_routes = self.list_peer_route_pair().await?;
         for p in peer_routes.iter() {
             let Some(next_hop_pair) = peer_routes
@@ -292,23 +418,48 @@ impl CommandHandler {
 
             if p.route.cost == 1 {
                 items.push(RouteTableItem {
-                    ipv4: p.route.ipv4_addr.clone(),
+                    ipv4: p
+                        .route
+                        .ipv4_addr
+                        .clone()
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_default(),
                     hostname: p.route.hostname.clone(),
                     proxy_cidrs: p.route.proxy_cidrs.clone().join(",").to_string(),
                     next_hop_ipv4: "DIRECT".to_string(),
                     next_hop_hostname: "".to_string(),
                     next_hop_lat: next_hop_pair.get_latency_ms().unwrap_or(0.0),
                     cost: p.route.cost,
+                    version: if p.route.version.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        p.route.version.to_string()
+                    },
                 });
             } else {
                 items.push(RouteTableItem {
-                    ipv4: p.route.ipv4_addr.clone(),
+                    ipv4: p
+                        .route
+                        .ipv4_addr
+                        .clone()
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_default(),
                     hostname: p.route.hostname.clone(),
                     proxy_cidrs: p.route.proxy_cidrs.clone().join(",").to_string(),
-                    next_hop_ipv4: next_hop_pair.route.ipv4_addr.clone(),
+                    next_hop_ipv4: next_hop_pair
+                        .route
+                        .ipv4_addr
+                        .clone()
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_default(),
                     next_hop_hostname: next_hop_pair.route.hostname.clone(),
                     next_hop_lat: next_hop_pair.get_latency_ms().unwrap_or(0.0),
                     cost: p.route.cost,
+                    version: if p.route.version.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        p.route.version.to_string()
+                    },
                 });
             }
         }
@@ -322,10 +473,12 @@ impl CommandHandler {
     }
 
     async fn handle_connector_list(&self) -> Result<(), Error> {
-        let mut client = self.get_connector_manager_client().await?;
-        let request = tonic::Request::new(ListConnectorRequest::default());
-        let response = client.list_connector(request).await?;
-        println!("response: {:#?}", response.into_inner());
+        let client = self.get_connector_manager_client().await?;
+        let request = ListConnectorRequest::default();
+        let response = client
+            .list_connector(BaseController::default(), request)
+            .await?;
+        println!("response: {:#?}", response);
         Ok(())
     }
 }
@@ -334,8 +487,13 @@ impl CommandHandler {
 #[tracing::instrument]
 async fn main() -> Result<(), Error> {
     let cli = Cli::parse();
+    let client = RpcClient::new(TcpTunnelConnector::new(
+        format!("tcp://{}:{}", cli.rpc_portal.ip(), cli.rpc_portal.port())
+            .parse()
+            .unwrap(),
+    ));
     let handler = CommandHandler {
-        addr: format!("http://{}:{}", cli.rpc_portal.ip(), cli.rpc_portal.port()),
+        client: Mutex::new(client),
         verbose: cli.verbose,
     };
 
@@ -356,6 +514,9 @@ async fn main() -> Result<(), Error> {
             }
             Some(PeerSubCommand::ListForeign) => {
                 handler.handle_foreign_network_list().await?;
+            }
+            Some(PeerSubCommand::ListGlobalForeign) => {
+                handler.handle_global_foreign_network_list().await?;
             }
             None => {
                 handler.handle_peer_list(&peer_args).await?;
@@ -380,7 +541,7 @@ async fn main() -> Result<(), Error> {
             Some(RouteSubCommand::Dump) => handler.handle_route_dump().await?,
         },
         SubCommand::Stun => {
-            timeout(Duration::from_secs(5), async move {
+            timeout(Duration::from_secs(25), async move {
                 let collector = StunInfoCollector::new_with_default_servers();
                 loop {
                     let ret = collector.get_stun_info();
@@ -395,11 +556,13 @@ async fn main() -> Result<(), Error> {
             .unwrap();
         }
         SubCommand::PeerCenter => {
-            let mut peer_center_client = handler.get_peer_center_client().await?;
+            let peer_center_client = handler.get_peer_center_client().await?;
             let resp = peer_center_client
-                .get_global_peer_map(GetGlobalPeerMapRequest::default())
-                .await?
-                .into_inner();
+                .get_global_peer_map(
+                    BaseController::default(),
+                    GetGlobalPeerMapRequest::default(),
+                )
+                .await?;
 
             #[derive(tabled::Tabled)]
             struct PeerCenterTableItem {
@@ -429,11 +592,13 @@ async fn main() -> Result<(), Error> {
             );
         }
         SubCommand::VpnPortal => {
-            let mut vpn_portal_client = handler.get_vpn_portal_client().await?;
+            let vpn_portal_client = handler.get_vpn_portal_client().await?;
             let resp = vpn_portal_client
-                .get_vpn_portal_info(GetVpnPortalInfoRequest::default())
+                .get_vpn_portal_info(
+                    BaseController::default(),
+                    GetVpnPortalInfoRequest::default(),
+                )
                 .await?
-                .into_inner()
                 .vpn_portal_info
                 .unwrap_or_default();
             println!("portal_name: {}", resp.vpn_type);
@@ -446,6 +611,44 @@ async fn main() -> Result<(), Error> {
                 resp.client_config
             );
             println!("connected_clients:\n{:#?}", resp.connected_clients);
+        }
+        SubCommand::Node(sub_cmd) => {
+            let client = handler.get_peer_manager_client().await?;
+            let node_info = client
+                .show_node_info(BaseController::default(), ShowNodeInfoRequest::default())
+                .await?
+                .node_info
+                .ok_or(anyhow::anyhow!("node info not found"))?;
+            match sub_cmd.sub_command {
+                Some(NodeSubCommand::Info) | None => {
+                    let stun_info = node_info.stun_info.clone().unwrap_or_default();
+
+                    let mut builder = tabled::builder::Builder::default();
+                    builder.push_record(vec!["Virtual IP", node_info.ipv4_addr.as_str()]);
+                    builder.push_record(vec!["Hostname", node_info.hostname.as_str()]);
+                    builder.push_record(vec![
+                        "Proxy CIDRs",
+                        node_info.proxy_cidrs.join(", ").as_str(),
+                    ]);
+                    builder.push_record(vec!["Peer ID", node_info.peer_id.to_string().as_str()]);
+                    builder.push_record(vec!["Public IP", stun_info.public_ip.join(", ").as_str()]);
+                    builder.push_record(vec![
+                        "UDP Stun Type",
+                        format!("{:?}", stun_info.udp_nat_type()).as_str(),
+                    ]);
+                    for (idx, l) in node_info.listeners.iter().enumerate() {
+                        if l.starts_with("ring") {
+                            continue;
+                        }
+                        builder.push_record(vec![format!("Listener {}", idx).as_str(), l]);
+                    }
+
+                    println!("{}", builder.build().with(Style::modern()).to_string());
+                }
+                Some(NodeSubCommand::Config) => {
+                    println!("{}", node_info.config);
+                }
+            }
         }
     }
 

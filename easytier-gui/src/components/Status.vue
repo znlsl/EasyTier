@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import type { NodeInfo } from '~/types/network'
-const { t } = useI18n()
+import { IPv4, IPv6 } from 'ip-num/IPNumber'
+import type { NodeInfo, PeerRoutePair } from '~/types/network'
 
 const props = defineProps<{
   instanceId?: string
 }>()
+
+const { t } = useI18n()
 
 const networkStore = useNetworkStore()
 
@@ -24,8 +26,16 @@ const curNetworkInst = computed(() => {
 })
 
 const peerRouteInfos = computed(() => {
-  if (curNetworkInst.value)
-    return curNetworkInst.value.detail?.peer_route_pairs || []
+  if (curNetworkInst.value) {
+    const my_node_info = curNetworkInst.value.detail?.my_node_info
+    return [{
+      route: {
+        ipv4_addr: my_node_info?.virtual_ipv4,
+        hostname: my_node_info?.hostname,
+        version: my_node_info?.version,
+      },
+    }, ...(curNetworkInst.value.detail?.peer_route_pairs || [])]
+  }
 
   return []
 })
@@ -33,8 +43,9 @@ const peerRouteInfos = computed(() => {
 function routeCost(info: any) {
   if (info.route) {
     const cost = info.route.cost
-    return cost === 1 ? 'p2p' : `relay(${cost})`
+    return cost ? cost === 1 ? 'p2p' : `relay(${cost})` : t('status.local')
   }
+
   return '?'
 }
 
@@ -73,27 +84,31 @@ function humanFileSize(bytes: number, si = false, dp = 1) {
   return `${bytes.toFixed(dp)} ${units[u]}`
 }
 
-function latencyMs(info: any) {
+function latencyMs(info: PeerRoutePair) {
   let lat_us_sum = statsCommon(info, 'stats.latency_us')
   if (lat_us_sum === undefined)
     return ''
-  lat_us_sum = lat_us_sum / 1000 / info.peer.conns.length
+  lat_us_sum = lat_us_sum / 1000 / info.peer!.conns.length
   return `${lat_us_sum % 1 > 0 ? Math.round(lat_us_sum) + 1 : Math.round(lat_us_sum)}ms`
 }
 
-function txBytes(info: any) {
+function txBytes(info: PeerRoutePair) {
   const tx = statsCommon(info, 'stats.tx_bytes')
   return tx ? humanFileSize(tx) : ''
 }
 
-function rxBytes(info: any) {
+function rxBytes(info: PeerRoutePair) {
   const rx = statsCommon(info, 'stats.rx_bytes')
   return rx ? humanFileSize(rx) : ''
 }
 
-function lossRate(info: any) {
+function lossRate(info: PeerRoutePair) {
   const lossRate = statsCommon(info, 'loss_rate')
   return lossRate !== undefined ? `${Math.round(lossRate * 100)}%` : ''
+}
+
+function version(info: PeerRoutePair) {
+  return info.route.version === '' ? 'unknown' : info.route.version
 }
 
 const myNodeInfo = computed(() => {
@@ -117,8 +132,16 @@ const myNodeInfoChips = computed(() => {
   if (!my_node_info)
     return chips
 
-  // virtual ipv4
+  // TUN Device Name
+  const dev_name = curNetworkInst.value.detail?.dev_name
+  if (dev_name) {
+    chips.push({
+      label: `TUN Device Name: ${dev_name}`,
+      icon: '',
+    } as Chip)
+  }
 
+  // virtual ipv4
   chips.push({
     label: `Virtual IPv4: ${my_node_info.virtual_ipv4}`,
     icon: '',
@@ -128,7 +151,7 @@ const myNodeInfoChips = computed(() => {
   const local_ipv4s = my_node_info.ips?.interface_ipv4s
   for (const [idx, ip] of local_ipv4s?.entries()) {
     chips.push({
-      label: `Local IPv4 ${idx}: ${ip}`,
+      label: `Local IPv4 ${idx}: ${IPv4.fromNumber(ip.addr)}`,
       icon: '',
     } as Chip)
   }
@@ -137,7 +160,11 @@ const myNodeInfoChips = computed(() => {
   const local_ipv6s = my_node_info.ips?.interface_ipv6s
   for (const [idx, ip] of local_ipv6s?.entries()) {
     chips.push({
-      label: `Local IPv6 ${idx}: ${ip}`,
+      label: `Local IPv6 ${idx}: ${IPv6.fromBigInt((BigInt(ip.part1) << BigInt(96))
+        + (BigInt(ip.part2) << BigInt(64))
+        + (BigInt(ip.part3) << BigInt(32))
+        + BigInt(ip.part4),
+      )}`,
       icon: '',
     } as Chip)
   }
@@ -146,7 +173,19 @@ const myNodeInfoChips = computed(() => {
   const public_ip = my_node_info.ips?.public_ipv4
   if (public_ip) {
     chips.push({
-      label: `Public IP: ${public_ip}`,
+      label: `Public IP: ${IPv4.fromNumber(public_ip.addr)}`,
+      icon: '',
+    } as Chip)
+  }
+
+  const public_ipv6 = my_node_info.ips?.public_ipv6
+  if (public_ipv6) {
+    chips.push({
+      label: `Public IPv6: ${IPv6.fromBigInt((BigInt(public_ipv6.part1) << BigInt(96))
+        + (BigInt(public_ipv6.part2) << BigInt(64))
+        + (BigInt(public_ipv6.part3) << BigInt(32))
+        + BigInt(public_ipv6.part4),
+      )}`,
       icon: '',
     } as Chip)
   }
@@ -373,6 +412,7 @@ function showEventLogs() {
             <Column :field="txBytes" style="width: 80px;" :header="t('upload_bytes')" />
             <Column :field="rxBytes" style="width: 80px;" :header="t('download_bytes')" />
             <Column :field="lossRate" style="width: 100px;" :header="t('loss_rate')" />
+            <Column :field="version" style="width: 100px;" :header="t('status.version')" />
           </DataTable>
         </template>
       </Card>

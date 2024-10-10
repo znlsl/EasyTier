@@ -184,13 +184,13 @@ pub async fn basic_three_node_test(#[values("tcp", "udp", "wg", "ws", "wss")] pr
     let insts = init_three_node(proto).await;
 
     check_route(
-        "10.144.144.2",
+        "10.144.144.2/24",
         insts[1].peer_id(),
         insts[0].get_peer_manager().list_routes().await,
     );
 
     check_route(
-        "10.144.144.3",
+        "10.144.144.3/24",
         insts[2].peer_id(),
         insts[0].get_peer_manager().list_routes().await,
     );
@@ -357,7 +357,7 @@ pub async fn subnet_proxy_three_node_test(
 
     wait_proxy_route_appear(
         &insts[0].get_peer_manager(),
-        "10.144.144.3",
+        "10.144.144.3/24",
         insts[2].peer_id(),
         "10.1.2.0/24",
     )
@@ -373,7 +373,10 @@ pub async fn subnet_proxy_three_node_test(
 #[tokio::test]
 #[serial_test::serial]
 pub async fn proxy_three_node_disconnect_test(#[values("tcp", "wg")] proto: &str) {
-    use crate::tunnel::wireguard::{WgConfig, WgTunnelConnector};
+    use crate::{
+        common::scoped_task::ScopedTask,
+        tunnel::wireguard::{WgConfig, WgTunnelConnector},
+    };
 
     let insts = init_three_node(proto).await;
     let mut inst4 = Instance::new(get_inst_config("inst4", Some("net_d"), "10.144.144.4"));
@@ -417,16 +420,25 @@ pub async fn proxy_three_node_disconnect_test(#[values("tcp", "wg")] proto: &str
             );
 
             set_link_status("net_d", false);
-            tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
-            let routes = insts[0].get_peer_manager().list_routes().await;
-            assert!(
-                routes
-                    .iter()
-                    .find(|r| r.peer_id == inst4.peer_id())
-                    .is_none(),
-                "inst4 should not be in inst1's route list, {:?}",
-                routes
-            );
+            let _t = ScopedTask::from(tokio::spawn(async move {
+                // do some ping in net_a to trigger net_c pingpong
+                loop {
+                    ping_test("net_a", "10.144.144.4", Some(1)).await;
+                }
+            }));
+            wait_for_condition(
+                || async {
+                    insts[0]
+                        .get_peer_manager()
+                        .list_routes()
+                        .await
+                        .iter()
+                        .find(|r| r.peer_id == inst4.peer_id())
+                        .is_none()
+                },
+                Duration::from_secs(15),
+            )
+            .await;
             set_link_status("net_d", true);
         }
     });
@@ -518,8 +530,8 @@ pub async fn foreign_network_forward_nic_data() {
 
     wait_for_condition(
         || async {
-            inst1.get_peer_manager().list_routes().await.len() == 1
-                && inst2.get_peer_manager().list_routes().await.len() == 1
+            inst1.get_peer_manager().list_routes().await.len() == 2
+                && inst2.get_peer_manager().list_routes().await.len() == 2
         },
         Duration::from_secs(5),
     )
@@ -689,4 +701,67 @@ pub async fn socks5_vpn_portal(#[values("10.144.144.1", "10.144.144.3")] dst_add
     drop(conn);
 
     tokio::join!(task).0.unwrap();
+}
+
+#[rstest::rstest]
+#[tokio::test]
+#[serial_test::serial]
+pub async fn manual_reconnector(#[values(true, false)] is_foreign: bool) {
+    prepare_linux_namespaces();
+
+    let center_node_config = get_inst_config("inst1", Some("net_a"), "10.144.144.1");
+    if is_foreign {
+        center_node_config
+            .set_network_identity(NetworkIdentity::new("center".to_string(), "".to_string()));
+    }
+    let mut center_inst = Instance::new(center_node_config);
+
+    let inst1_config = get_inst_config("inst1", Some("net_b"), "10.144.145.1");
+    inst1_config.set_listeners(vec![]);
+    let mut inst1 = Instance::new(inst1_config);
+
+    let mut inst2 = Instance::new(get_inst_config("inst2", Some("net_c"), "10.144.145.2"));
+
+    center_inst.run().await.unwrap();
+    inst1.run().await.unwrap();
+    inst2.run().await.unwrap();
+
+    assert_ne!(inst1.id(), center_inst.id());
+    assert_ne!(inst2.id(), center_inst.id());
+
+    inst1
+        .get_conn_manager()
+        .add_connector(RingTunnelConnector::new(
+            format!("ring://{}", center_inst.id()).parse().unwrap(),
+        ));
+
+    inst2
+        .get_conn_manager()
+        .add_connector(RingTunnelConnector::new(
+            format!("ring://{}", center_inst.id()).parse().unwrap(),
+        ));
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    let peer_map = if !is_foreign {
+        inst1.get_peer_manager().get_peer_map()
+    } else {
+        inst1
+            .get_peer_manager()
+            .get_foreign_network_client()
+            .get_peer_map()
+    };
+
+    let conns = peer_map
+        .list_peer_conns(center_inst.peer_id())
+        .await
+        .unwrap();
+
+    assert_eq!(1, conns.len());
+
+    wait_for_condition(
+        || async { ping_test("net_b", "10.144.145.2", None).await },
+        Duration::from_secs(5),
+    )
+    .await;
 }

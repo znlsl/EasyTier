@@ -5,7 +5,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use crate::{
     common::{config::ConfigLoader, get_logger_timer_rfc3339},
-    rpc::cli::{NatType, PeerInfo, Route},
+    proto::{
+        cli::{PeerInfo, Route},
+        common::NatType,
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,10 +117,12 @@ pub fn list_peer_route_pair(peers: Vec<PeerInfo>, routes: Vec<Route>) -> Vec<Pee
 
     for route in routes.iter() {
         let peer = peers.iter().find(|peer| peer.peer_id == route.peer_id);
-        pairs.push(PeerRoutePair {
+        let pair = PeerRoutePair {
             route: route.clone(),
             peer: peer.cloned(),
-        });
+        };
+
+        pairs.push(pair);
     }
 
     pairs

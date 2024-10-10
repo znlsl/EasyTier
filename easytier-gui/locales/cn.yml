@@ -13,6 +13,7 @@ proxy_cidrs: 子网代理CIDR
 enable_vpn_portal: 启用VPN门户
 vpn_portal_listen_port: 监听端口
 vpn_portal_client_network: 客户端子网
+dev_name: TUN接口名称
 advanced_settings: 高级设置
 basic_settings: 基础设置
 listener_urls: 监听地址
@@ -45,11 +46,13 @@ enable_auto_launch: 开启开机自启
 exit: 退出
 chips_placeholder: 例如： {0}, 按回车添加
 hostname_placeholder: '留空默认为主机名: {0}'
+dev_name_placeholder: 注意：当多个网络同时使用相同的TUN接口名称时，将会在设置TUN的IP时产生冲突，留空以自动生成随机名称
 off_text: 点击关闭
 on_text: 点击开启
 show_config: 显示配置
 close: 关闭
 
+use_latency_first: 延迟优先模式
 my_node_info: 当前节点信息
 peer_count: 已连接
 upload: 上传
@@ -66,6 +69,10 @@ upload_bytes: 上传
 download_bytes: 下载
 loss_rate: 丢包率
 
+status:
+  version: 内核版本
+  local: 本机
+
 run_network: 运行网络
 stop_network: 停止网络
 network_running: 运行中
@@ -75,3 +82,12 @@ dhcp_experimental_warning: 实验性警告！使用DHCP时如果组网环境中�
 tray:
   show: 显示 / 隐藏
   exit: 退出
+
+about:
+  title: 关于
+  version: 版本
+  author: 作者
+  homepage: 主页
+  license: 许可证
+  description: 一个简单、安全、去中心化的内网穿透 VPN 组网方案，使用 Rust 语言和 Tokio 框架实现。
+  check_update: 检查更新

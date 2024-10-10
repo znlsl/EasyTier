@@ -7,12 +7,11 @@ use tokio::sync::RwLock;
 use crate::{
     common::{
         error::Error,
-        global_ctx::{ArcGlobalCtx, GlobalCtxEvent},
+        global_ctx::{ArcGlobalCtx, GlobalCtxEvent, NetworkIdentity},
         PeerId,
     },
-    rpc::PeerConnInfo,
-    tunnel::packet_def::ZCPacket,
-    tunnel::TunnelError,
+    proto::cli::PeerConnInfo,
+    tunnel::{packet_def::ZCPacket, TunnelError},
 };
 
 use super::{
@@ -66,7 +65,7 @@ impl PeerMap {
     }
 
     pub fn has_peer(&self, peer_id: PeerId) -> bool {
-        self.peer_map.contains_key(&peer_id)
+        peer_id == self.my_peer_id || self.peer_map.contains_key(&peer_id)
     }
 
     pub async fn send_msg_directly(&self, msg: ZCPacket, dst_peer_id: PeerId) -> Result<(), Error> {
@@ -113,14 +112,26 @@ impl PeerMap {
                 .get_next_hop_with_policy(dst_peer_id, policy.clone())
                 .await
             {
-                // for foreign network, gateway_peer_id may not connect to me
-                if self.has_peer(gateway_peer_id) {
-                    return Some(gateway_peer_id);
-                }
+                // NOTIC: for foreign network, gateway_peer_id may not connect to me
+                return Some(gateway_peer_id);
             }
         }
 
         None
+    }
+
+    pub async fn list_peers_own_foreign_network(
+        &self,
+        network_identity: &NetworkIdentity,
+    ) -> Vec<PeerId> {
+        let mut ret = Vec::new();
+        for route in self.routes.read().await.iter() {
+            let peers = route
+                .list_peers_own_foreign_network(&network_identity)
+                .await;
+            ret.extend(peers);
+        }
+        ret
     }
 
     pub async fn send_msg(
@@ -238,5 +249,15 @@ impl PeerMap {
             }
         }
         route_map
+    }
+}
+
+impl Drop for PeerMap {
+    fn drop(&mut self) {
+        tracing::debug!(
+            self.my_peer_id,
+            network = ?self.global_ctx.get_network_identity(),
+            "PeerMap is dropped"
+        );
     }
 }
